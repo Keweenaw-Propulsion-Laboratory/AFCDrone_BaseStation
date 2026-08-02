@@ -13,11 +13,13 @@
 // Singleton instance of the radio driver
 RH_RF69 rf69(RFM69_CS, RFM69_INT);
 
+void send();
+
 void setup() {
     Serial.begin(9600);
     while (!Serial); 
     Serial.println("Arduino Uno RFM69HCW Test");
-
+ 
     // Hard reset the radio module (Adafruit breakout specific)
     pinMode(RFM69_RST, OUTPUT);
     digitalWrite(RFM69_RST, LOW);
@@ -53,9 +55,18 @@ void setup() {
     Serial.println("Setup complete! Radio is ready.");
 }
 
+bool connected = false;
+
 void loop() {
+    digitalWrite(13,connected);
+
+    if (!connected) {
+        send();
+    }
+
     // Check if a radio packet has arrived
     if (rf69.available()) {
+        connected = true;
         // Create a buffer to hold the incoming data
         uint8_t buf[RH_RF69_MAX_MESSAGE_LEN];
         uint8_t len = sizeof(buf);
@@ -93,16 +104,19 @@ void loop() {
             Serial.println("Receive failed");
         }
     }
+
+    delay(500);
 }
 
 void send() {
     Serial.println("Sending packet...");
     
-    char radiopacket[] = "Hello from Uno!";
-    
-    rf69.send((uint8_t *)radiopacket, strlen(radiopacket));
+    // char radiopacket[] = "Hello from Uno!";
+
+    uint8_t ack[8] = {0x69,0x69,0x69,0x69,0x69,0x69,0x69,0x69};
+
+    rf69.send((uint8_t *)ack, 8);
     rf69.waitPacketSent();
     
     Serial.println("Packet sent successfully.");
-    delay(2000); // Wait 2 seconds before sending again
 }
