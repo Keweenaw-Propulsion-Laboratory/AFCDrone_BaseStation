@@ -42,9 +42,9 @@ The base station requires:
 The default bridge configuration is:
 
 ```cpp
-static constexpr uint8_t RFM69_CS  = 10;
-static constexpr uint8_t RFM69_INT = 2;
-static constexpr uint8_t RFM69_RST = 9;
+static constexpr uint8_t RFM69_CS  = 4;
+static constexpr uint8_t RFM69_INT = 3;
+static constexpr uint8_t RFM69_RST = 2;
 
 static constexpr float RF69_FREQUENCY_MHZ = 915.0f;
 static constexpr uint32_t USB_BAUD = 115200;
