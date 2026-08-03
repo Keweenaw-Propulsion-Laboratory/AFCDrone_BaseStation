@@ -15,11 +15,25 @@ RH_RF69 rf69(RFM69_CS, RFM69_INT);
 
 void send();
 
+struct __attribute__((packed)) Command_t {
+    struct __attribute__((packed)) flags {
+        uint8_t targSlot : 1; /**The slot to be configured */
+        uint8_t activeSlot : 1; /** The slot to be currently active */
+        uint8_t empty : 6; // 6 Unused flags
+    } flags;
+    int16_t gimbalX;
+    int16_t gimbalY;
+    uint8_t motor0Speed;
+    uint8_t motor1Speed;
+    uint8_t empty0; // Unused command field
+
+};
+
+
 void setup() {
-    Serial.begin(9600);
+    Serial.begin(115200);
     while (!Serial); 
-    Serial.println("Arduino Uno RFM69HCW Test");
- 
+    
     // Hard reset the radio module (Adafruit breakout specific)
     pinMode(RFM69_RST, OUTPUT);
     digitalWrite(RFM69_RST, LOW);
@@ -60,8 +74,10 @@ bool connected = false;
 void loop() {
     digitalWrite(13,connected);
 
-    if (!connected) {
+    if (true) {
         send();
+        delay(1000);
+        return;
     }
 
     // Check if a radio packet has arrived
@@ -113,9 +129,25 @@ void send() {
     
     // char radiopacket[] = "Hello from Uno!";
 
-    uint8_t ack[8] = {0x69,0x69,0x69,0x69,0x69,0x69,0x69,0x69};
+    Command_t cmd;
 
-    rf69.send((uint8_t *)ack, 8);
+    cmd.flags.activeSlot = 0;
+    cmd.flags.targSlot = 0;
+    cmd.gimbalX = 0;
+    cmd.gimbalY = 0;
+    cmd.motor0Speed = 50;
+    cmd.motor1Speed = 1;
+
+    uint8_t frame[sizeof(Command_t)];
+
+    memcpy(&frame, &cmd, sizeof(Command_t));
+
+    static int counter = 0;
+
+    rf69.setHeaderId(counter++);
+    rf69.setHeaderFlags(8);
+
+    rf69.send(frame, sizeof(Command_t));
     rf69.waitPacketSent();
     
     Serial.println("Packet sent successfully.");
