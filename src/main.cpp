@@ -84,47 +84,47 @@ struct __attribute__((packed)) RadioStatus0 {
     uint8_t currentMode;
 };
 
+// These structures must exactly match the current radio_Message union on the drone. 
 struct __attribute__((packed)) RadioStatus1 {
-    int8_t gimbalPitchNorm;
-    int8_t gimbalYawNorm;
-    uint8_t topServoSet;
-    uint8_t bottomServoSet;
-    uint8_t motor1Set;
-    uint8_t motor2Set;
-    uint16_t voltage;
+    int16_t gimbalPitchNorm;
+    int16_t gimbalYawNorm;
+    int16_t topServoSet;
+    int16_t bottomServoSet;
 };
 
 struct __attribute__((packed)) RadioStatus2 {
+    uint8_t motor1Set;
+    uint8_t motor2Set;
+    uint16_t voltage;
+    uint8_t unused[4];
+};
+
+struct __attribute__((packed)) RadioStatus3 {
     int16_t qR;
     int16_t qI;
     int16_t qJ;
     int16_t qK;
 };
 
-struct __attribute__((packed)) RadioStatus3 {
+struct __attribute__((packed)) RadioStatus4 {
     int16_t accelX;
     int16_t accelY;
     int16_t accelZ;
     int16_t unused;
 };
 
-struct __attribute__((packed)) RadioStatus4 {
+struct __attribute__((packed)) RadioStatus5 {
     int16_t velX;
     int16_t velY;
     int16_t velZ;
     int16_t unused;
 };
 
-struct __attribute__((packed)) RadioStatus5 {
+struct __attribute__((packed)) RadioStatus6 {
     int16_t posX;
     int16_t posY;
     int16_t posZ;
     int16_t unused;
-};
-
-struct __attribute__((packed)) RadioStatus6 {
-    float latitude;
-    float longitude;
 };
 
 union __attribute__((packed)) RadioPayload {
@@ -376,47 +376,41 @@ static void applyRadioStatus(uint8_t messageType, const RadioPayload& payload) {
             break;
 
         case RADIO_STATUS1:
-            telemetry.gimbalPitch =
-                static_cast<int16_t>(payload.status1.gimbalPitchNorm);
-            telemetry.gimbalYaw =
-                static_cast<int16_t>(payload.status1.gimbalYawNorm);
-            telemetry.topServoSet =
-                static_cast<int16_t>(payload.status1.topServoSet);
-            telemetry.bottomServoSet =
-                static_cast<int16_t>(payload.status1.bottomServoSet);
-            telemetry.motor1Set = payload.status1.motor1Set;
-            telemetry.motor2Set = payload.status1.motor2Set;
-            telemetry.voltage = payload.status1.voltage;
+            telemetry.gimbalPitch = payload.status1.gimbalPitchNorm;
+            telemetry.gimbalYaw = payload.status1.gimbalYawNorm;
+            telemetry.topServoSet = payload.status1.topServoSet;
+            telemetry.bottomServoSet = payload.status1.bottomServoSet;
             break;
 
         case RADIO_STATUS2:
-            telemetry.qR = payload.status2.qR;
-            telemetry.qI = payload.status2.qI;
-            telemetry.qJ = payload.status2.qJ;
-            telemetry.qK = payload.status2.qK;
+            telemetry.motor1Set = payload.status2.motor1Set;
+            telemetry.motor2Set = payload.status2.motor2Set;
+            telemetry.voltage = payload.status2.voltage;
             break;
 
         case RADIO_STATUS3:
-            telemetry.accelX = payload.status3.accelX;
-            telemetry.accelY = payload.status3.accelY;
-            telemetry.accelZ = payload.status3.accelZ;
+            telemetry.qR = payload.status3.qR;
+            telemetry.qI = payload.status3.qI;
+            telemetry.qJ = payload.status3.qJ;
+            telemetry.qK = payload.status3.qK;
             break;
 
         case RADIO_STATUS4:
-            telemetry.velX = payload.status4.velX;
-            telemetry.velY = payload.status4.velY;
-            telemetry.velZ = payload.status4.velZ;
+            telemetry.accelX = payload.status4.accelX;
+            telemetry.accelY = payload.status4.accelY;
+            telemetry.accelZ = payload.status4.accelZ;
             break;
 
         case RADIO_STATUS5:
-            telemetry.posX = payload.status5.posX;
-            telemetry.posY = payload.status5.posY;
-            telemetry.posZ = payload.status5.posZ;
+            telemetry.velX = payload.status5.velX;
+            telemetry.velY = payload.status5.velY;
+            telemetry.velZ = payload.status5.velZ;
             break;
 
         case RADIO_STATUS6:
-            telemetry.latitude = payload.status6.latitude;
-            telemetry.longitude = payload.status6.longitude;
+            telemetry.posX = payload.status6.posX;
+            telemetry.posY = payload.status6.posY;
+            telemetry.posZ = payload.status6.posZ;
             break;
 
         default:
