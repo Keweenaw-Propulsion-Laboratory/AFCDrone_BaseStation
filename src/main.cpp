@@ -1,20 +1,33 @@
 /*
- * AFC Drone RF69 <-> Desktop Dashboard Bridge
+ * AFC Drone RF69 <-> Desktop Dashboard Relay
  *
- * Radio side:
- *   - RadioHead RH_RF69
- *   - 915 MHz
+ * The base station is a transparent relay. It does not decode telemetry or
+ * commands; the dashboard (AFCDrone_BaseController) owns the RF message
+ * layouts and talks to the drone through RADIO_PACKET envelopes.
+ *
+ * Radio side (must match AFC-Drone src/radio.cpp):
+ *   - RadioHead RH_RF69, 915 MHz, GFSK_Rb250Fd250
  *   - 16-byte encryption key matching the drone
  *   - RadioHead ID header: packet number
  *   - RadioHead FLAGS header: message type
- *   - RF application payload: 8-byte radio_Message
- *   - No RF startup handshake; the bridge only receives telemetry and sends controls
+ *   - RF application payload: 8-byte Radio::Message
+ *   - The drone pings with SETUP "AFCDrone" until it receives a SETUP packet
+ *     carrying the ACK pattern (8 x 0x69); this relay answers that itself.
  *
- * USB side:
- *   - Binary dashboard frame:
+ * USB side (must match AFCDrone_BaseController src/protocol.js):
+ *   - Binary frame:
  *       A5 5A 01 <packetLo> <packetHi> <type> <length> <payload...> <crcLo> <crcHi>
- *   - CRC-16/CCITT-FALSE is calculated over:
- *       packet number, type, length, and payload (version excluded)
+ *   - CRC-16/CCITT-FALSE over packet number, type, length, and payload
+ *     (magic and version excluded)
+ *   - RAW (0): identify query 0x3F -> reply 0x02 (base station relay)
+ *   - RADIO_PACKET (2):
+ *       [0] direction (0 = received over RF, 1 = sent over RF)
+ *       [1] RF packet number (headerId)
+ *       [2] RF message type (headerFlags)
+ *       [3..10] 8-byte RF message
+ *       [11] downlink RSSI magnitude (received packets only)
+ *     Dashboard -> relay RADIO_PACKET frames are transmit requests; the relay
+ *     assigns its own RF packet number.
  *
  * IMPORTANT:
  *   Do not print normal text to Serial. Any ASCII output will corrupt the
@@ -31,6 +44,7 @@
 // -----------------------------------------------------------------------------
 
 // Change these three pins to match the Arduino and RF69 breakout wiring.
+// On an Uno, RFM69_INT must be pin 2 or 3 (the only external interrupt pins).
 static constexpr uint8_t RFM69_CS  = 4;
 static constexpr uint8_t RFM69_INT = 3;
 static constexpr uint8_t RFM69_RST = 2;
@@ -47,9 +61,6 @@ static constexpr int8_t STATUS_LED_PIN = -1;
 
 static constexpr uint32_t USB_BAUD = 115200;
 
-// The dashboard can accept telemetry faster than this, but 20 Hz is enough for
-// graphs and keeps the serial stream comfortably below its limit.
-static constexpr uint32_t TELEMETRY_PERIOD_MS = 50;
 static constexpr uint32_t RADIO_TIMEOUT_MS = 2000;
 
 static const uint8_t RF69_ENCRYPTION_KEY[16] = {
@@ -63,83 +74,17 @@ RH_RF69 radio(RFM69_CS, RFM69_INT);
 // Radio protocol
 // -----------------------------------------------------------------------------
 
-enum RadioMessageType : uint8_t {
-    RADIO_SETUP   = 0,
-    RADIO_STATUS0 = 1,
-    RADIO_STATUS1 = 2,
-    RADIO_STATUS2 = 3,
-    RADIO_STATUS3 = 4,
-    RADIO_STATUS4 = 5,
-    RADIO_STATUS5 = 6,
-    RADIO_STATUS6 = 7,
-    RADIO_COMMAND = 8,
-    RADIO_CONFIG  = 9
-};
+// Only the values the relay itself acts on. Every other type is forwarded
+// untouched in both directions.
+static constexpr uint8_t RADIO_SETUP     = 0;
+static constexpr uint8_t RADIO_HEARTBEAT = 10;
 
-struct __attribute__((packed)) RadioStatus0 {
-    uint16_t loopTimeAvg;
-    uint16_t loopTimeMax;
-    uint16_t runTime;
-    uint8_t rssi;
-    uint8_t currentMode;
-};
+static constexpr uint8_t RADIO_MESSAGE_SIZE = 8;
 
-// These structures must exactly match the current radio_Message union on the drone. 
-struct __attribute__((packed)) RadioStatus1 {
-    int16_t gimbalPitchNorm;
-    int16_t gimbalYawNorm;
-    int16_t topServoSet;
-    int16_t bottomServoSet;
+// Radio::ack on the drone.
+static const uint8_t RADIO_LINK_ACK[RADIO_MESSAGE_SIZE] = {
+    0x69, 0x69, 0x69, 0x69, 0x69, 0x69, 0x69, 0x69
 };
-
-struct __attribute__((packed)) RadioStatus2 {
-    uint8_t motor1Set;
-    uint8_t motor2Set;
-    uint16_t voltage;
-    uint8_t unused[4];
-};
-
-struct __attribute__((packed)) RadioStatus3 {
-    int16_t qR;
-    int16_t qI;
-    int16_t qJ;
-    int16_t qK;
-};
-
-struct __attribute__((packed)) RadioStatus4 {
-    int16_t accelX;
-    int16_t accelY;
-    int16_t accelZ;
-    int16_t unused;
-};
-
-struct __attribute__((packed)) RadioStatus5 {
-    int16_t velX;
-    int16_t velY;
-    int16_t velZ;
-    int16_t unused;
-};
-
-struct __attribute__((packed)) RadioStatus6 {
-    int16_t posX;
-    int16_t posY;
-    int16_t posZ;
-    int16_t unused;
-};
-
-union __attribute__((packed)) RadioPayload {
-    uint8_t raw[8];
-    char text[8];
-    RadioStatus0 status0;
-    RadioStatus1 status1;
-    RadioStatus2 status2;
-    RadioStatus3 status3;
-    RadioStatus4 status4;
-    RadioStatus5 status5;
-    RadioStatus6 status6;
-};
-
-static_assert(sizeof(RadioPayload) == 8, "Every RF payload must be 8 bytes");
 
 // -----------------------------------------------------------------------------
 // Dashboard protocol
@@ -148,72 +93,27 @@ static_assert(sizeof(RadioPayload) == 8, "Every RF payload must be 8 bytes");
 enum DashboardMessageType : uint8_t {
     DASHBOARD_RAW          = 0,
     DASHBOARD_DEBUG_TEXT   = 1,
-    DASHBOARD_RADIO_PACKET = 2,
-    DASHBOARD_TELEMETRY    = 3,
-    DASHBOARD_COMMAND      = 4
+    DASHBOARD_RADIO_PACKET = 2
 };
-
-struct __attribute__((packed)) DashboardTelemetry {
-    // Status 0
-    uint16_t loopTimeAvg;
-    uint16_t loopTimeMax;
-    uint16_t runTime;
-    uint8_t rssi;
-    uint8_t currentMode;
-
-    // Status 1
-    int16_t gimbalPitch;
-    int16_t gimbalYaw;
-    int16_t topServoSet;
-    int16_t bottomServoSet;
-
-    // Remaining status 1 values
-    uint8_t motor1Set;
-    uint8_t motor2Set;
-    uint16_t voltage;
-
-    // Status 2
-    int16_t qR;
-    int16_t qI;
-    int16_t qJ;
-    int16_t qK;
-
-    // Status 3
-    int16_t accelX;
-    int16_t accelY;
-    int16_t accelZ;
-
-    // Status 4
-    int16_t velX;
-    int16_t velY;
-    int16_t velZ;
-
-    // Status 5
-    int16_t posX;
-    int16_t posY;
-    int16_t posZ;
-
-    // Status 6
-    float latitude;
-    float longitude;
-};
-
-static_assert(sizeof(DashboardTelemetry) == 54,
-              "Dashboard telemetry layout must remain 54 bytes");
 
 static constexpr uint8_t DASHBOARD_MAGIC_0 = 0xA5;
 static constexpr uint8_t DASHBOARD_MAGIC_1 = 0x5A;
 static constexpr uint8_t DASHBOARD_VERSION = 0x01;
-static constexpr uint8_t DASHBOARD_MAX_PAYLOAD = 60;
+static constexpr uint8_t DASHBOARD_MAX_PAYLOAD = 64;
 
-static DashboardTelemetry telemetry = {};
-static bool telemetryDirty = false;
+static constexpr uint8_t IDENTIFY_QUERY_BYTE = 0x3F;
+static constexpr uint8_t DEVICE_KIND_BASE_STATION_RELAY = 0x02;
+
+static constexpr uint8_t RADIO_DIRECTION_RECEIVED = 0;
+static constexpr uint8_t RADIO_DIRECTION_SENT = 1;
+
+// direction + packet number + type + message
+static constexpr uint8_t RADIO_ENVELOPE_SIZE = 3 + RADIO_MESSAGE_SIZE;
+
 static uint16_t dashboardTxPacketNumber = 0;
 static uint8_t radioTxPacketNumber = 0;
-static uint32_t lastTelemetrySendMs = 0;
 static uint32_t lastRadioPacketMs = 0;
 static bool droneConnected = false;
-static bool reportedFirstTelemetry = false;
 static bool reportedLengthMismatch = false;
 
 // -----------------------------------------------------------------------------
@@ -301,17 +201,6 @@ static void sendDashboardFrame(
     Serial.write(crcBytes, sizeof(crcBytes));
 }
 
-static void sendTelemetry() {
-    sendDashboardFrame(
-        DASHBOARD_TELEMETRY,
-        reinterpret_cast<const uint8_t*>(&telemetry),
-        sizeof(telemetry)
-    );
-
-    telemetryDirty = false;
-    lastTelemetrySendMs = millis();
-}
-
 static void sendDashboardText(const char* text) {
     if (text == nullptr) {
         return;
@@ -329,32 +218,9 @@ static void sendDashboardText(const char* text) {
     );
 }
 
-// -----------------------------------------------------------------------------
-// RF transmit
-// -----------------------------------------------------------------------------
-
-static void restoreRadioReceiveMode() {
-    radio.setModeRx();
-}
-
-static void sendDroneCommand(const uint8_t commandPayload[8]) {
-    // Match the drone protocol exactly: packet metadata lives in RadioHead's
-    // ID and FLAGS headers, while send() receives only the 8-byte message.
-    radio.setHeaderId(radioTxPacketNumber++);
-    radio.setHeaderFlags(RADIO_COMMAND);
-
-    radio.send(commandPayload, sizeof(RadioPayload));
-    radio.waitPacketSent();
-    restoreRadioReceiveMode();
-}
-
-// -----------------------------------------------------------------------------
-// RF receive and telemetry aggregation
-// -----------------------------------------------------------------------------
-
 static uint8_t rssiMagnitudeFromDbm(int16_t rssiDbm) {
-    // RH_RF69 normally reports a negative dBm number. The current dashboard
-    // telemetry layout stores one unsigned byte, so send its positive magnitude.
+    // RH_RF69 reports a negative dBm number. The envelope's RSSI field is one
+    // unsigned byte, so send its positive magnitude.
     int16_t magnitude = -rssiDbm;
 
     if (magnitude < 0) {
@@ -366,59 +232,72 @@ static uint8_t rssiMagnitudeFromDbm(int16_t rssiDbm) {
     return static_cast<uint8_t>(magnitude);
 }
 
-static void applyRadioStatus(uint8_t messageType, const RadioPayload& payload) {
-    switch (messageType) {
-        case RADIO_STATUS0:
-            telemetry.loopTimeAvg = payload.status0.loopTimeAvg;
-            telemetry.loopTimeMax = payload.status0.loopTimeMax;
-            telemetry.runTime = payload.status0.runTime;
-            telemetry.currentMode = payload.status0.currentMode;
-            break;
+/**
+ * Mirrors one RF packet to the dashboard as a RADIO_PACKET frame. Received
+ * packets carry the downlink RSSI as a 12th byte; sent packets do not.
+ */
+static void sendRadioEnvelope(
+    uint8_t direction,
+    uint8_t packetNumber,
+    uint8_t messageType,
+    const uint8_t message[RADIO_MESSAGE_SIZE],
+    bool includeRssi,
+    uint8_t rssi
+) {
+    uint8_t envelope[RADIO_ENVELOPE_SIZE + 1];
+    envelope[0] = direction;
+    envelope[1] = packetNumber;
+    envelope[2] = messageType;
+    memcpy(&envelope[3], message, RADIO_MESSAGE_SIZE);
+    envelope[RADIO_ENVELOPE_SIZE] = rssi;
 
-        case RADIO_STATUS1:
-            telemetry.gimbalPitch = payload.status1.gimbalPitchNorm;
-            telemetry.gimbalYaw = payload.status1.gimbalYawNorm;
-            telemetry.topServoSet = payload.status1.topServoSet;
-            telemetry.bottomServoSet = payload.status1.bottomServoSet;
-            break;
-
-        case RADIO_STATUS2:
-            telemetry.motor1Set = payload.status2.motor1Set;
-            telemetry.motor2Set = payload.status2.motor2Set;
-            telemetry.voltage = payload.status2.voltage;
-            break;
-
-        case RADIO_STATUS3:
-            telemetry.qR = payload.status3.qR;
-            telemetry.qI = payload.status3.qI;
-            telemetry.qJ = payload.status3.qJ;
-            telemetry.qK = payload.status3.qK;
-            break;
-
-        case RADIO_STATUS4:
-            telemetry.accelX = payload.status4.accelX;
-            telemetry.accelY = payload.status4.accelY;
-            telemetry.accelZ = payload.status4.accelZ;
-            break;
-
-        case RADIO_STATUS5:
-            telemetry.velX = payload.status5.velX;
-            telemetry.velY = payload.status5.velY;
-            telemetry.velZ = payload.status5.velZ;
-            break;
-
-        case RADIO_STATUS6:
-            telemetry.posX = payload.status6.posX;
-            telemetry.posY = payload.status6.posY;
-            telemetry.posZ = payload.status6.posZ;
-            break;
-
-        default:
-            return;
-    }
-
-    telemetryDirty = true;
+    sendDashboardFrame(
+        DASHBOARD_RADIO_PACKET,
+        envelope,
+        includeRssi ? RADIO_ENVELOPE_SIZE + 1 : RADIO_ENVELOPE_SIZE
+    );
 }
+
+// -----------------------------------------------------------------------------
+// RF transmit
+// -----------------------------------------------------------------------------
+
+static void restoreRadioReceiveMode() {
+    radio.setModeRx();
+}
+
+static void transmitRadio(
+    uint8_t messageType,
+    const uint8_t message[RADIO_MESSAGE_SIZE]
+) {
+    // Match the drone protocol exactly: packet metadata lives in RadioHead's
+    // ID and FLAGS headers, while send() receives only the 8-byte message.
+    const uint8_t packetNumber = radioTxPacketNumber++;
+
+    radio.setHeaderId(packetNumber);
+    radio.setHeaderFlags(messageType);
+
+    radio.send(message, RADIO_MESSAGE_SIZE);
+    radio.waitPacketSent();
+    restoreRadioReceiveMode();
+
+    // Heartbeats go out every 25 ms; mirroring them would flood the USB link
+    // and the dashboard's packet log for no diagnostic value.
+    if (messageType != RADIO_HEARTBEAT) {
+        sendRadioEnvelope(
+            RADIO_DIRECTION_SENT,
+            packetNumber,
+            messageType,
+            message,
+            false,
+            0
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// RF receive
+// -----------------------------------------------------------------------------
 
 static void processRadio() {
     if (!radio.available()) {
@@ -432,14 +311,8 @@ static void processRadio() {
         return;
     }
 
-    lastRadioPacketMs = millis();
-    droneConnected = true;
-    telemetry.rssi = rssiMagnitudeFromDbm(radio.lastRssi());
-
     // RadioHead removes its four transport headers before recv() returns.
-    // The drone stores the packet number in ID, the message type in FLAGS, and
-    // sends only the 8-byte radio_Message as the application payload.
-    if (length != sizeof(RadioPayload)) {
+    if (length != RADIO_MESSAGE_SIZE) {
         if (!reportedLengthMismatch) {
             sendDashboardText("RF payload length mismatch");
             reportedLengthMismatch = true;
@@ -449,18 +322,28 @@ static void processRadio() {
 
     const uint8_t packetNumber = radio.headerId();
     const uint8_t messageType = radio.headerFlags();
-    (void)packetNumber; // Reserved for packet-loss tracking.
+    const uint8_t rssi = rssiMagnitudeFromDbm(radio.lastRssi());
 
-    RadioPayload payload;
-    memcpy(payload.raw, frame, sizeof(payload.raw));
+    if (!droneConnected) {
+        sendDashboardText("RF link up");
+    }
+    lastRadioPacketMs = millis();
+    droneConnected = true;
 
-    if (messageType >= RADIO_STATUS0 && messageType <= RADIO_STATUS6) {
-        applyRadioStatus(messageType, payload);
+    sendRadioEnvelope(
+        RADIO_DIRECTION_RECEIVED,
+        packetNumber,
+        messageType,
+        frame,
+        true,
+        rssi
+    );
 
-        if (!reportedFirstTelemetry) {
-            sendDashboardText("RF telemetry received");
-            reportedFirstTelemetry = true;
-        }
+    // The drone keeps re-sending its SETUP ping until it sees the ACK, and
+    // re-pings after a reboot, so answer every one rather than only the first.
+    if (messageType == RADIO_SETUP &&
+        memcmp(frame, RADIO_LINK_ACK, RADIO_MESSAGE_SIZE) != 0) {
+        transmitRadio(RADIO_SETUP, RADIO_LINK_ACK);
     }
 }
 
@@ -500,8 +383,24 @@ static void handleDashboardFrame(
     const uint8_t* payload,
     uint8_t payloadLength
 ) {
-    if (type == DASHBOARD_COMMAND && payloadLength == 8) {
-        sendDroneCommand(payload);
+    switch (type) {
+        case DASHBOARD_RAW:
+            if (payloadLength == 1 && payload[0] == IDENTIFY_QUERY_BYTE) {
+                const uint8_t reply = DEVICE_KIND_BASE_STATION_RELAY;
+                sendDashboardFrame(DASHBOARD_RAW, &reply, 1);
+            }
+            break;
+
+        case DASHBOARD_RADIO_PACKET:
+            // Transmit request: [direction hint, packet placeholder, type,
+            // 8-byte message]. The relay assigns its own packet number.
+            if (payloadLength >= RADIO_ENVELOPE_SIZE) {
+                transmitRadio(payload[2], &payload[3]);
+            }
+            break;
+
+        default:
+            break;
     }
 }
 
@@ -601,12 +500,21 @@ static void setStatusLed(bool on) {
     }
 }
 
-[[noreturn]] static void fatalBlink() {
+[[noreturn]] static void fatalError(const char* reason) {
     if (STATUS_LED_PIN >= 0) {
         pinMode(static_cast<uint8_t>(STATUS_LED_PIN), OUTPUT);
     }
 
+    // Keep reporting the failure so a dashboard that connects late still sees
+    // why the relay is silent, instead of a port that never answers.
+    uint32_t lastReportMs = 0;
+
     while (true) {
+        if (millis() - lastReportMs >= 1000) {
+            sendDashboardText(reason);
+            lastReportMs = millis();
+        }
+
         setStatusLed(true);
         delay(100);
         setStatusLed(false);
@@ -635,43 +543,35 @@ void setup() {
     resetRadioHardware();
 
     if (!radio.init()) {
-        fatalBlink();
+        fatalError("RF69 init failed - check CS/RST wiring");
     }
 
-    // Use the exact modem profile that was verified by the standalone
-    // receiver. Both ends must use the same profile.
+    // The drone relies on RH_RF69::init()'s default profile, which is this one.
     if (!radio.setModemConfig(RH_RF69::GFSK_Rb250Fd250)) {
-        fatalBlink();
+        fatalError("RF69 modem config failed");
     }
 
     if (!radio.setFrequency(RF69_FREQUENCY_MHZ)) {
-        fatalBlink();
+        fatalError("RF69 frequency set failed");
     }
 
-    radio.setEncryptionKey(RF69_ENCRYPTION_KEY);
+    radio.setEncryptionKey(const_cast<uint8_t*>(RF69_ENCRYPTION_KEY));
     radio.setTxPower(RF69_TX_POWER_DBM, RF69_HIGH_POWER);
     restoreRadioReceiveMode();
 
     // This is a framed dashboard debug message, not raw serial text.
-    sendDashboardText("RF69 bridge ready");
+    sendDashboardText("RF69 relay ready");
 }
 
 void loop() {
     processDashboardSerial();
     processRadio();
 
-    const uint32_t now = millis();
-
     if (droneConnected &&
-        static_cast<uint32_t>(now - lastRadioPacketMs) > RADIO_TIMEOUT_MS) {
+        static_cast<uint32_t>(millis() - lastRadioPacketMs) > RADIO_TIMEOUT_MS) {
         droneConnected = false;
+        sendDashboardText("RF link lost");
     }
 
     setStatusLed(droneConnected);
-
-    if (telemetryDirty &&
-        static_cast<uint32_t>(now - lastTelemetrySendMs) >=
-            TELEMETRY_PERIOD_MS) {
-        sendTelemetry();
-    }
 }
