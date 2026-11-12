@@ -16,6 +16,7 @@ The base station is a transparent relay. It does not decode telemetry or build c
 - Echoes sent packets back as `RADIO_PACKET` with direction `1`, except heartbeats, which would flood the link.
 - Answers the drone's `SETUP` link ping (`"AFCDrone"`) with the ACK pattern (8 x `0x69`), so the drone reports `BaseStation CONNECTED`.
 - Reports `RF link up` and `RF link lost` (no packets for 2 s) as debug text.
+- Pendulum timing test: keeps its clock synchronised with the drone's and times each pass of the drone over a TMAG5273 Hall sensor. See [Pendulum timing test](#pendulum-timing-test).
 
 ## Hardware
 
@@ -70,6 +71,8 @@ RF message types (from the drone's `Radio::MessageType`):
 | 8 | `COMMAND` | Dashboard to drone |
 | 9 | `CONFIG` | Both |
 | 10 | `HEARTBEAT` | Dashboard to drone |
+| 15 | `TIME_PING` | Relay to drone (clock sync; not forwarded) |
+| 16 | `TIME_PONG` | Drone to relay (clock sync; not forwarded) |
 
 ## USB protocol
 
@@ -98,6 +101,51 @@ The CRC is CRC-16/CCITT-FALSE (poly `0x1021`, init `0xFFFF`, little-endian). It 
 | 11 | Downlink RSSI magnitude, for example `62` = -62 dBm (received packets only) |
 
 For dashboard-to-relay requests, only bytes 2–10 are used. The relay assigns its own RF packet number.
+
+## Pendulum timing test
+
+The drone swings on a pendulum logging its gyro to SD. A magnet on the drone passes over a TMAG5273 at the bottom of the swing, and the relay times each pass with its own `micros()`. Radio clock sync then puts those times on the drone's clock, so they can be compared with the gyro to well under 1 ms.
+
+### Extra wiring
+
+| TMAG5273 (SparkFun Qwiic) | Arduino Uno | Notes |
+|---|---|---|
+| `SDA` | A4 | Through a 3.3 V level shifter; the board is 3.3 V only |
+| `SCL` | A5 | Through the level shifter |
+| `3V3` | 3.3 V | |
+| `GND` | GND | |
+
+The sensor is found at 0x22, 0x35, 0x78 or 0x44, whichever answers with TI's ID, and reported at boot as `TMAG5273 at 0x22, +-80 mT, axis Z`. Mount it so the chosen axis (`MAG_AXIS`, default Z) points at the magnet when the drone hangs at rest. That axis's field then peaks at the bottom of the swing and is symmetric about it.
+
+### Tuning
+
+Settings are at the top of [src/main.cpp](src/main.cpp):
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `MAG_AXIS` | `MAG_AXIS_Z` | Axis measured. Only one is converted, for the fastest sampling. |
+| `PASS_ENTER_UT` / `PASS_EXIT_UT` | 2000 / 1000 uT | Distance from the resting field that starts and ends a pass |
+| `PASS_MAX_MS` | 500 | A longer "pass" is discarded and the baseline re-learnt |
+| `PING_INTERVAL_MS` | 200 | Clock-sync rate |
+
+Once a second the relay prints `MAG <field> uT base <baseline> uT <rate> Hz passes <n>`. Swing the drone by hand and set `PASS_ENTER_UT` to about half the peak deviation from the baseline. Sampling runs at about 4–5 kHz. The baseline is learnt from the first 256 samples after boot, so keep the magnet away from the sensor while the relay starts.
+
+### How a pass is timed
+
+Each sample is stamped with `micros()`. The pass time is the centroid of the field above the exit level, integrated over the actual sample times. For a field symmetric about the bottom of the swing, that is the bottom, independent of the threshold. Pings are held while a pass is in progress, so a radio transmit does not leave a hole in it.
+
+### Clock sync
+
+Every 200 ms, while the drone is linked, the relay sends `TIME_PING` and the drone answers `TIME_PONG`. Both ends stamp the moments the RFM69 reports PacketSent and PayloadReady inside its interrupt. The Uno's ceramic resonator can be off by thousands of ppm and drifts with temperature, so offsets are not applied live: every exchange is logged, and `AFC-Drone/scripts/pendulum_sync.py` fits them afterwards.
+
+### Frames to the dashboard
+
+| Type | Payload |
+|---:|---|
+| 20 `BASE_TIMESYNC` (18 bytes) | `uint16 seq`, `uint32 t1`, `uint32 t2`, `uint32 t4`, `uint8 prevSeq`, `uint16 prevTxMinusRx`, `uint8 rssi` |
+| 21 `BASE_MAG_PASS` (26 bytes) | `uint16 index`, `uint32 centroidUs`, `uint32 startUs`, `uint32 endUs`, `uint32 peakUs`, `int16 peakRaw`, `int16 baselineRaw`, `uint16 samples`, `uint16 maxGapUs` |
+
+Run the dashboard server with `--pendulum-log DIR` to write these to CSV.
 
 ## Building
 

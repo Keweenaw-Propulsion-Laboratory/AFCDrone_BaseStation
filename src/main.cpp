@@ -11,9 +11,14 @@
  *   - RadioHead ID header: packet number
  *   - RadioHead FLAGS header: message type
  *   - RF application payload: 8-byte Radio::Message
- *   - Beam break: when the IR beam is interrupted the relay itself transmits a
- *     RADIO_BEAM_BREAK packet: bytes 0-3 = millis() timestamp (uint32 LE),
- *     bytes 4-5 = trigger count (uint16 LE), bytes 6-7 = 0.
+ *   - Clock sync (pendulum timing test): the relay sends TIME_PING (15) every
+ *     PING_INTERVAL_MS and the drone answers TIME_PONG (16). Both ends stamp
+ *     micros() in the RFM69 DIO0 interrupt; the relay reports each completed
+ *     exchange to the dashboard as a BASE_TIMESYNC frame. Neither is relayed
+ *     as a RADIO_PACKET.
+ *   - Pendulum pass detector: a TMAG5273 Hall sensor at the bottom of the
+ *     swing, a magnet on the drone. Each pass of the magnet is reported as a
+ *     BASE_MAG_PASS frame timed by this Uno's micros().
  *   - The drone pings with SETUP "AFCDrone" until it receives a SETUP packet
  *     carrying the ACK pattern (8 x 0x69); this relay answers that itself.
  *
@@ -31,6 +36,8 @@
  *       [11] downlink RSSI magnitude (received packets only)
  *     Dashboard -> relay RADIO_PACKET frames are transmit requests; the relay
  *     assigns its own RF packet number.
+ *   - BASE_TIMESYNC (20), BASE_MAG_PASS (21): see sendTimeSyncFrame() and
+ *     sendPassFrame(). All times are this Uno's micros(), uint32 LE.
  *
  * IMPORTANT:
  *   Do not print normal text to Serial. Any ASCII output will corrupt the
@@ -40,6 +47,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <RH_RF69.h>
+#include <Wire.h>
 #include <string.h>
 
 // -----------------------------------------------------------------------------
@@ -65,32 +73,37 @@ static constexpr int8_t STATUS_LED_PIN = -1;
 static constexpr uint32_t USB_BAUD = 115200;
 
 // Set false to run without an RF69 attached: radio init, RX and TX are all
-// skipped, and beam breaks are only reported to the dashboard as debug text.
-static constexpr bool RADIO_ENABLED = false;
+// skipped, and so is clock sync. Passes are still detected and reported.
+static constexpr bool RADIO_ENABLED = true;
 
-// IR beam break. The LED must be on pin 9 (Timer1 OC1A generates the 38 kHz
-// carrier in hardware). The receiver (TSOP-style, active-low output) can be
-// on any free pin.
-static constexpr uint8_t IR_LED_PIN = 9;
-static constexpr uint8_t IR_RX_PIN = 7;
-// Indicator LED: on while the beam is intact, off while broken.
-static constexpr uint8_t BEAM_LED_PIN = 6;
+// Clock sync with the drone. 5 Hz gives the offline fit plenty of points to
+// follow the Uno's ceramic resonator, which can be off by thousands of ppm.
+static constexpr uint16_t PING_INTERVAL_MS = 200;
 
-// The receiver (VS1838B/TSOP1838 type) suppresses steady or periodic carrier
-// as interference, so the beam is a NEC-style frame instead: 9 ms leader burst,
-// 4.5 ms space, 8 random data bits (562 us burst + 562/1687 us space), a stop
-// burst, then a ~12 ms gap. Frames repeat about every 40 ms.
-static constexpr uint16_t IR_LEADER_ON_US = 9000;
-static constexpr uint16_t IR_LEADER_OFF_US = 4500;
-static constexpr uint16_t IR_BIT_ON_US = 562;
-static constexpr uint16_t IR_BIT_ZERO_OFF_US = 562;
-static constexpr uint16_t IR_BIT_ONE_OFF_US = 1687;
-static constexpr uint16_t IR_FRAME_GAP_US = 12000;
-static constexpr uint8_t IR_FRAME_BITS = 8;
-// leader (2) + bits (2 each) + stop burst + frame gap
-static constexpr uint8_t IR_FRAME_STEPS = 2 + 2 * IR_FRAME_BITS + 2;
-// Beam counts as broken when no burst has been seen for this long.
-static constexpr uint16_t BEAM_BREAK_TIMEOUT_MS = 120;
+// TMAG5273 pass detector, on the Uno's I2C pins (A4 = SDA, A5 = SCL) through a
+// 3.3 V level shifter. The first address in this list that answers with TI's
+// manufacturer ID is used: SparkFun's board is 0x22, other variants differ.
+static const uint8_t MAG_ADDRESSES[] = {0x22, 0x35, 0x78, 0x44};
+
+// Which axis to measure. Pick the one that points from the sensor to the
+// magnet at the bottom of the swing: its field peaks there and is symmetric
+// about the bottom, which is what the centroid timing relies on.
+enum MagAxis : uint8_t { MAG_AXIS_X = 0, MAG_AXIS_Y = 1, MAG_AXIS_Z = 2 };
+static constexpr MagAxis MAG_AXIS = MAG_AXIS_Z;
+
+// The field must move this far from the resting baseline to start a pass, and
+// fall back inside the exit level to end one. In microtesla; Earth's field is
+// about 50 uT and a small neodymium magnet a couple of cm away gives tens of
+// mT. Tune with the "MAG" debug lines, which report the live field.
+static constexpr int32_t PASS_ENTER_UT = 2000;
+static constexpr int32_t PASS_EXIT_UT = 1000;
+
+// A pass longer than this is not a swing going by (magnet parked over the
+// sensor, or a baseline that moved); it is dropped and the baseline re-learnt.
+static constexpr uint16_t PASS_MAX_MS = 500;
+
+// How often the live field is reported as debug text, for tuning.
+static constexpr uint16_t MAG_REPORT_MS = 1000;
 
 static constexpr uint32_t RADIO_TIMEOUT_MS = 2000;
 
@@ -99,7 +112,47 @@ static const uint8_t RF69_ENCRYPTION_KEY[16] = {
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
 };
 
-RH_RF69 radio(RFM69_CS, RFM69_INT);
+/**
+ * RH_RF69 with the moment of every DIO0 interrupt recorded.
+ *
+ * DIO0 rises on PacketSent while transmitting and on PayloadReady while
+ * receiving, at a fixed point at the end of each packet. micros() taken there
+ * is the clock-sync timestamp; the drone does exactly the same, so the radio's
+ * own latencies cancel in the two-way exchange.
+ */
+class TimedRF69 : public RH_RF69 {
+public:
+    TimedRF69(uint8_t cs, uint8_t irq) : RH_RF69(cs, irq), irqPin(irq) { self = this; }
+
+    /** Call after init(), which attached RadioHead's own handler. */
+    void attachTimedInterrupt() {
+        attachInterrupt(digitalPinToInterrupt(irqPin), timedIsr, RISING);
+    }
+
+    uint32_t lastRxUs() const { return rxUs; }
+    uint32_t lastTxDoneUs() const { return txDoneUs; }
+
+private:
+    static void timedIsr() {
+        const uint32_t now = micros();
+        const RHMode before = self->_mode;
+        self->handleInterrupt();
+        if (before == RHModeTx && self->_mode != RHModeTx) {
+            self->txDoneUs = now;
+        } else if (before == RHModeRx && self->_rxBufValid) {
+            self->rxUs = now;
+        }
+    }
+
+    static TimedRF69* self;
+    const uint8_t irqPin;
+    volatile uint32_t rxUs = 0;
+    volatile uint32_t txDoneUs = 0;
+};
+
+TimedRF69* TimedRF69::self = nullptr;
+
+TimedRF69 radio(RFM69_CS, RFM69_INT);
 
 // -----------------------------------------------------------------------------
 // Radio protocol
@@ -109,9 +162,9 @@ RH_RF69 radio(RFM69_CS, RFM69_INT);
 // untouched in both directions.
 static constexpr uint8_t RADIO_SETUP     = 0;
 static constexpr uint8_t RADIO_HEARTBEAT = 10;
-// Must match the type the drone expects for beam-break events. 20 is a
-// placeholder; change it to the drone's value.
-static constexpr uint8_t RADIO_BEAM_BREAK = 20;
+// Radio::MessageType::TIME_PING / TIME_PONG on the drone.
+static constexpr uint8_t RADIO_TIME_PING = 15;
+static constexpr uint8_t RADIO_TIME_PONG = 16;
 
 static constexpr uint8_t RADIO_MESSAGE_SIZE = 8;
 
@@ -127,7 +180,11 @@ static const uint8_t RADIO_LINK_ACK[RADIO_MESSAGE_SIZE] = {
 enum DashboardMessageType : uint8_t {
     DASHBOARD_RAW          = 0,
     DASHBOARD_DEBUG_TEXT   = 1,
-    DASHBOARD_RADIO_PACKET = 2
+    DASHBOARD_RADIO_PACKET = 2,
+    // Pendulum test frames, base station only. Clear of the drone's own USB
+    // types (0-10).
+    DASHBOARD_BASE_TIMESYNC = 20,
+    DASHBOARD_BASE_MAG_PASS = 21
 };
 
 static constexpr uint8_t DASHBOARD_MAGIC_0 = 0xA5;
@@ -320,8 +377,9 @@ static void transmitRadio(
     restoreRadioReceiveMode();
 
     // Heartbeats go out every 25 ms; mirroring them would flood the USB link
-    // and the dashboard's packet log for no diagnostic value.
-    if (messageType != RADIO_HEARTBEAT) {
+    // and the dashboard's packet log for no diagnostic value. Pings are
+    // reported through BASE_TIMESYNC instead.
+    if (messageType != RADIO_HEARTBEAT && messageType != RADIO_TIME_PING) {
         sendRadioEnvelope(
             RADIO_DIRECTION_SENT,
             packetNumber,
@@ -331,6 +389,83 @@ static void transmitRadio(
             0
         );
     }
+}
+
+// -----------------------------------------------------------------------------
+// Clock sync
+// -----------------------------------------------------------------------------
+
+// t1 of the recent pings, indexed by the low bits of their sequence number.
+// A pong older than PING_SLOTS pings is too stale to be worth matching.
+static constexpr uint8_t PING_SLOTS = 16;
+static uint32_t pingT1[PING_SLOTS];
+static uint16_t pingSeq[PING_SLOTS];
+static bool pingValid[PING_SLOTS];
+static uint16_t nextPingSeq = 0;
+static uint32_t lastPingMs = 0;
+
+static void writeU16(uint8_t* p, uint16_t v) {
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+}
+
+static void writeU32(uint8_t* p, uint32_t v) {
+    p[0] = static_cast<uint8_t>(v);
+    p[1] = static_cast<uint8_t>(v >> 8);
+    p[2] = static_cast<uint8_t>(v >> 16);
+    p[3] = static_cast<uint8_t>(v >> 24);
+}
+
+static uint32_t readU32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static void sendPing() {
+    const uint16_t seq = nextPingSeq++;
+    uint8_t message[RADIO_MESSAGE_SIZE] = {static_cast<uint8_t>(seq), 0, 0, 0, 0, 0, 0, 0};
+
+    // transmitRadio() blocks until PacketSent, so the stamp is this ping's.
+    transmitRadio(RADIO_TIME_PING, message);
+
+    const uint8_t slot = seq % PING_SLOTS;
+    pingT1[slot] = radio.lastTxDoneUs();
+    pingSeq[slot] = seq;
+    pingValid[slot] = true;
+}
+
+/**
+ * BASE_TIMESYNC payload, 18 bytes:
+ *   [0..1]   seq           uint16, full ping sequence number
+ *   [2..5]   t1            relay micros() at the ping's PacketSent
+ *   [6..9]   t2            drone micros() at the ping's PayloadReady
+ *   [10..13] t4            relay micros() at the pong's PayloadReady
+ *   [14]     prevSeq       low byte of an earlier ping's seq...
+ *   [15..16] prevTxMinusRx ...whose pong left the drone this long after its
+ *                          t2 (t3 - t2, us); 0xFFFF = unknown
+ *   [17]     rssi          pong RSSI magnitude, dBm
+ */
+static void handleTimePong(const uint8_t* pong, uint32_t t4, uint8_t rssi) {
+    const uint8_t seqLow = pong[0];
+    const uint8_t slot = seqLow % PING_SLOTS;
+    if (!pingValid[slot] || static_cast<uint8_t>(pingSeq[slot]) != seqLow) {
+        return; // Answer to a ping we no longer remember
+    }
+    pingValid[slot] = false;
+
+    uint8_t payload[18];
+    writeU16(&payload[0], pingSeq[slot]);
+    writeU32(&payload[2], pingT1[slot]);
+    writeU32(&payload[6], readU32(&pong[2]));
+    writeU32(&payload[10], t4);
+    payload[14] = pong[1];
+    payload[15] = pong[6];
+    payload[16] = pong[7];
+    payload[17] = rssi;
+
+    sendDashboardFrame(DASHBOARD_BASE_TIMESYNC, payload, sizeof(payload));
 }
 
 // -----------------------------------------------------------------------------
@@ -344,6 +479,8 @@ static void processRadio() {
 
     uint8_t frame[RH_RF69_MAX_MESSAGE_LEN];
     uint8_t length = sizeof(frame);
+    // Taken before recv(), which re-arms the receiver.
+    const uint32_t rxUs = radio.lastRxUs();
 
     if (!radio.recv(frame, &length)) {
         return;
@@ -368,6 +505,11 @@ static void processRadio() {
     lastRadioPacketMs = millis();
     droneConnected = true;
 
+    if (messageType == RADIO_TIME_PONG) {
+        handleTimePong(frame, rxUs, rssi);
+        return;
+    }
+
     sendRadioEnvelope(
         RADIO_DIRECTION_RECEIVED,
         packetNumber,
@@ -386,106 +528,250 @@ static void processRadio() {
 }
 
 // -----------------------------------------------------------------------------
-// Beam break
+// Pendulum pass detector (TMAG5273)
 // -----------------------------------------------------------------------------
 
-static bool beamIntact = false;
-static bool irCarrierOn = false;
-static uint16_t beamBreakCount = 0;
-static uint32_t lastBurstToggleUs = 0;
-static uint16_t currentPhaseUs = 0;
-static uint8_t irStep = IR_FRAME_STEPS - 1;
-static uint8_t irFrameByte = 0;
-static uint32_t lastBeamSeenMs = 0;
+// TMAG5273 registers and fields (TI datasheet SLYS045).
+static constexpr uint8_t TMAG_DEVICE_CONFIG_1 = 0x00;
+static constexpr uint8_t TMAG_DEVICE_CONFIG_2 = 0x01;
+static constexpr uint8_t TMAG_SENSOR_CONFIG_1 = 0x02;
+static constexpr uint8_t TMAG_SENSOR_CONFIG_2 = 0x03;
+static constexpr uint8_t TMAG_DEVICE_ID = 0x0D;
+static constexpr uint8_t TMAG_MANUFACTURER_ID_LSB = 0x0E;
+static constexpr uint8_t TMAG_X_MSB_RESULT = 0x12; // Y and Z follow, 2 bytes each
 
-static void setupBeamBreak() {
-    randomSeed(analogRead(A0));
+static constexpr uint8_t TMAG_MODE_CONTINUOUS = 0x02;
+static constexpr uint8_t TMAG_WIDE_RANGE = 0x03;   // X_Y_RANGE and Z_RANGE: +-80 / +-266 mT
+static constexpr uint16_t TI_MANUFACTURER_ID = 0x5449;
 
-    pinMode(IR_LED_PIN, OUTPUT);
-    digitalWrite(IR_LED_PIN, LOW);
-    pinMode(IR_RX_PIN, INPUT_PULLUP);
-    pinMode(BEAM_LED_PIN, OUTPUT);
-    digitalWrite(BEAM_LED_PIN, LOW);
+static uint8_t magAddress = 0;      // 0 = no sensor found
+static int32_t magRangeUt = 0;      // Full scale of the configured range
+static int32_t passEnterCounts = 0;
+static int32_t passExitCounts = 0;
 
-    // Timer1 CTC, no prescaler: toggle OC1A every 210 ticks -> ~38.1 kHz.
-    // The output stays disconnected (COM1A0 = 0) until a burst starts.
-    TCCR1A = 0;
-    TCCR1B = _BV(WGM12) | _BV(CS10);
-    OCR1A = (F_CPU / (2UL * 38000UL)) - 1;
+// Resting field, in counts x 16 for a smooth fixed-point average.
+static int32_t baselineX16 = 0;
+static bool baselineReady = false;
+static uint16_t baselineSamples = 0;
+
+struct Pass {
+    bool active;
+    uint32_t startUs;
+    uint32_t lastUs;
+    int32_t lastWeight;    // Weight of the previous sample, counts above exit level
+    float area;            // Integral of weight dt
+    float moment;          // Integral of weight * (t - startUs) dt
+    uint32_t peakUs;
+    int16_t peakRaw;
+    int32_t peakDev;
+    uint16_t samples;
+    uint16_t maxGapUs;
+};
+
+static Pass pass = {};
+static uint16_t passCount = 0;
+
+// For the 1 Hz MAG debug line
+static uint16_t samplesThisSecond = 0;
+static uint32_t lastMagReportMs = 0;
+static int16_t lastRaw = 0;
+
+static bool tmagWrite(uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(magAddress);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
 }
 
-static void setIrCarrier(bool on) {
-    if (on) {
-        TCCR1A |= _BV(COM1A0);
-    } else {
-        TCCR1A &= ~_BV(COM1A0);
-        digitalWrite(IR_LED_PIN, LOW);
-    }
-    irCarrierOn = on;
+static bool tmagRead(uint8_t address, uint8_t reg, uint8_t* out, uint8_t length) {
+    Wire.beginTransmission(address);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(address, length) != length) return false;
+    for (uint8_t i = 0; i < length; ++i) out[i] = static_cast<uint8_t>(Wire.read());
+    return true;
 }
 
-// Duration of the given step of the frame. Even steps are bursts, odd steps
-// are spaces.
-static uint16_t irStepDurationUs(uint8_t step) {
-    if (step == 0) return IR_LEADER_ON_US;
-    if (step == 1) return IR_LEADER_OFF_US;
-    if (step == IR_FRAME_STEPS - 2) return IR_BIT_ON_US;
-    if (step == IR_FRAME_STEPS - 1) return IR_FRAME_GAP_US;
-
-    const uint8_t bit = (step - 2) / 2;
-    if (step % 2 == 0) return IR_BIT_ON_US;
-    return ((irFrameByte >> bit) & 1u) ? IR_BIT_ONE_OFF_US : IR_BIT_ZERO_OFF_US;
+static int32_t microteslaToCounts(int32_t ut) {
+    return static_cast<int32_t>((static_cast<int64_t>(ut) * 32768) / magRangeUt);
 }
 
-static void sendBeamBreak() {
-    const uint32_t timestamp = millis();
+static void setupMag() {
+    Wire.begin();
+    Wire.setClock(400000);
+    // A sensor that stops answering must not hang the relay forever.
+    Wire.setWireTimeout(3000, true);
 
-    uint8_t message[RADIO_MESSAGE_SIZE] = {
-        static_cast<uint8_t>(timestamp & 0xFFu),
-        static_cast<uint8_t>((timestamp >> 8) & 0xFFu),
-        static_cast<uint8_t>((timestamp >> 16) & 0xFFu),
-        static_cast<uint8_t>((timestamp >> 24) & 0xFFu),
-        static_cast<uint8_t>(beamBreakCount & 0xFFu),
-        static_cast<uint8_t>((beamBreakCount >> 8) & 0xFFu),
-        0,
-        0
-    };
-    ++beamBreakCount;
-
-    if (RADIO_ENABLED) {
-        transmitRadio(RADIO_BEAM_BREAK, message);
-    } else {
-        sendDashboardText("Beam break (radio disabled)");
-    }
-
-    // The transmit blocks the loop and delays burst sampling; don't let that
-    // look like a second break.
-    lastBeamSeenMs = millis();
-}
-
-static void processBeamBreak() {
-    const uint32_t nowUs = micros();
-    if (nowUs - lastBurstToggleUs >= currentPhaseUs) {
-        lastBurstToggleUs = nowUs;
-        irStep = (irStep + 1) % IR_FRAME_STEPS;
-        if (irStep == 0) {
-            irFrameByte = random(256);
+    for (uint8_t i = 0; i < sizeof(MAG_ADDRESSES); ++i) {
+        uint8_t id[2];
+        if (tmagRead(MAG_ADDRESSES[i], TMAG_MANUFACTURER_ID_LSB, id, 2) &&
+            (static_cast<uint16_t>(id[0]) | (static_cast<uint16_t>(id[1]) << 8)) == TI_MANUFACTURER_ID) {
+            magAddress = MAG_ADDRESSES[i];
+            break;
         }
-        setIrCarrier(irStep % 2 == 0);
-        currentPhaseUs = irStepDurationUs(irStep);
     }
 
-    // Receiver output is active low while it sees the 38 kHz carrier.
+    if (magAddress == 0) {
+        sendDashboardText("TMAG5273 not found - check I2C wiring/level shifter");
+        return;
+    }
+
+    // DEVICE_ID bits 1:0: 1 = +-40/80 mT part, 2 = +-133/266 mT part. The wide
+    // range of either is selected below.
+    uint8_t version = 0;
+    tmagRead(magAddress, TMAG_DEVICE_ID, &version, 1);
+    magRangeUt = (version & 0x03) == 2 ? 266000L : 80000L;
+
+    const bool ok =
+        tmagWrite(TMAG_DEVICE_CONFIG_1, 0x00) &&                        // 1x averaging: fastest conversion
+        tmagWrite(TMAG_SENSOR_CONFIG_2, TMAG_WIDE_RANGE) &&
+        tmagWrite(TMAG_SENSOR_CONFIG_1, static_cast<uint8_t>(
+                      (MAG_AXIS == MAG_AXIS_X ? 0x1 : MAG_AXIS == MAG_AXIS_Y ? 0x2 : 0x4) << 4)) &&
+        tmagWrite(TMAG_DEVICE_CONFIG_2, TMAG_MODE_CONTINUOUS);
+    if (!ok) {
+        magAddress = 0;
+        sendDashboardText("TMAG5273 config write failed");
+        return;
+    }
+
+    passEnterCounts = microteslaToCounts(PASS_ENTER_UT);
+    passExitCounts = microteslaToCounts(PASS_EXIT_UT);
+
+    char text[48];
+    snprintf(text, sizeof(text), "TMAG5273 at 0x%02X, +-%ld mT, axis %c",
+             magAddress, static_cast<long>(magRangeUt / 1000), "XYZ"[MAG_AXIS]);
+    sendDashboardText(text);
+}
+
+/**
+ * BASE_MAG_PASS payload, 26 bytes:
+ *   [0..1]   index       uint16, +1 per pass
+ *   [2..5]   centroidUs  field-weighted mean time of the pass: the bottom of
+ *                        the swing, for a field symmetric about it
+ *   [6..9]   startUs     first sample past the enter level
+ *   [10..13] endUs       first sample back inside the exit level
+ *   [14..17] peakUs      sample with the largest deviation
+ *   [18..19] peakRaw     int16 raw reading at peakUs
+ *   [20..21] baselineRaw int16 resting reading
+ *   [22..23] samples     uint16 samples in the pass
+ *   [24..25] maxGapUs    uint16 longest time between two of them
+ * Field in mT = raw * range / 32768; range is in the TMAG5273 debug line.
+ */
+static void sendPassFrame() {
+    const uint32_t centroidUs = pass.startUs + static_cast<uint32_t>(pass.moment / pass.area + 0.5f);
+
+    uint8_t payload[26];
+    writeU16(&payload[0], passCount);
+    writeU32(&payload[2], centroidUs);
+    writeU32(&payload[6], pass.startUs);
+    writeU32(&payload[10], pass.lastUs);
+    writeU32(&payload[14], pass.peakUs);
+    writeU16(&payload[18], static_cast<uint16_t>(pass.peakRaw));
+    writeU16(&payload[20], static_cast<uint16_t>(baselineX16 / 16));
+    writeU16(&payload[22], pass.samples);
+    writeU16(&payload[24], pass.maxGapUs);
+
+    sendDashboardFrame(DASHBOARD_BASE_MAG_PASS, payload, sizeof(payload));
+    ++passCount;
+}
+
+/**
+ * Take one field sample and run the pass detector on it.
+ *
+ * The bottom of the swing is found as the centroid of the field above the
+ * exit level, integrated with the trapezoid rule over the actual sample times.
+ * That holds up to uneven sampling (a radio transmit pauses the loop for a
+ * millisecond or so) and does not depend on the threshold, as long as the
+ * field is symmetric about the bottom.
+ */
+static void processMag() {
+    if (magAddress == 0) return;
+
+    uint8_t bytes[2];
+    // Stamp the middle of the read: the conversion it returns finished just
+    // before it, a fixed latency the same on every pass.
+    const uint32_t before = micros();
+    if (!tmagRead(magAddress, TMAG_X_MSB_RESULT + 2 * MAG_AXIS, bytes, 2)) return;
+    const uint32_t nowUs = before + (micros() - before) / 2;
+
+    const int16_t raw = static_cast<int16_t>((static_cast<uint16_t>(bytes[0]) << 8) | bytes[1]);
+    lastRaw = raw;
+    ++samplesThisSecond;
+
+    // Learn the resting field before detecting anything.
+    if (!baselineReady) {
+        baselineX16 = baselineSamples == 0 ? static_cast<int32_t>(raw) * 16
+                                           : baselineX16 + (static_cast<int32_t>(raw) * 16 - baselineX16) / 8;
+        if (++baselineSamples >= 256) baselineReady = true;
+        return;
+    }
+
+    int32_t deviation = static_cast<int32_t>(raw) - baselineX16 / 16;
+    if (deviation < 0) deviation = -deviation;
+
+    if (!pass.active) {
+        if (deviation >= passEnterCounts) {
+            pass = Pass{};
+            pass.active = true;
+            pass.startUs = nowUs;
+            pass.lastUs = nowUs;
+            pass.lastWeight = deviation - passExitCounts;
+            pass.peakUs = nowUs;
+            pass.peakRaw = raw;
+            pass.peakDev = deviation;
+            pass.samples = 1;
+        } else {
+            // Track slow drift (temperature, the drone parked off-centre)
+            // only while nothing is passing.
+            baselineX16 += (static_cast<int32_t>(raw) * 16 - baselineX16) / 256;
+        }
+        return;
+    }
+
+    const uint32_t dt = nowUs - pass.lastUs;
+    const int32_t weight = deviation > passExitCounts ? deviation - passExitCounts : 0;
+    const float tPrev = static_cast<float>(pass.lastUs - pass.startUs);
+    const float tNow = static_cast<float>(nowUs - pass.startUs);
+    pass.area += 0.5f * (pass.lastWeight + weight) * dt;
+    pass.moment += 0.5f * (pass.lastWeight * tPrev + weight * tNow) * dt;
+    if (dt > pass.maxGapUs) pass.maxGapUs = dt > 0xFFFF ? 0xFFFF : static_cast<uint16_t>(dt);
+    pass.lastUs = nowUs;
+    pass.lastWeight = weight;
+    ++pass.samples;
+
+    if (deviation > pass.peakDev) {
+        pass.peakDev = deviation;
+        pass.peakRaw = raw;
+        pass.peakUs = nowUs;
+    }
+
+    if (deviation <= passExitCounts) {
+        pass.active = false;
+        if (pass.area > 0.0f) sendPassFrame();
+    } else if (nowUs - pass.startUs > static_cast<uint32_t>(PASS_MAX_MS) * 1000UL) {
+        pass.active = false;
+        baselineReady = false;
+        baselineSamples = 0;
+        sendDashboardText("MAG pass too long - relearning baseline");
+    }
+}
+
+static void reportMag() {
+    if (magAddress == 0) return;
     const uint32_t nowMs = millis();
-    if (digitalRead(IR_RX_PIN) == LOW) {
-        lastBeamSeenMs = nowMs;
-        beamIntact = true;
-    } else if (beamIntact && nowMs - lastBeamSeenMs > BEAM_BREAK_TIMEOUT_MS) {
-        beamIntact = false;
-        sendBeamBreak();
-    }
+    if (nowMs - lastMagReportMs < MAG_REPORT_MS) return;
 
-    digitalWrite(BEAM_LED_PIN, beamIntact ? HIGH : LOW);
+    const int32_t fieldUt = static_cast<int32_t>((static_cast<int64_t>(lastRaw) * magRangeUt) / 32768);
+    const int32_t baseUt = static_cast<int32_t>((static_cast<int64_t>(baselineX16 / 16) * magRangeUt) / 32768);
+    char text[64];
+    snprintf(text, sizeof(text), "MAG %ld uT base %ld uT %u Hz passes %u",
+             static_cast<long>(fieldUt), static_cast<long>(baseUt),
+             static_cast<unsigned>(samplesThisSecond * 1000UL / (nowMs - lastMagReportMs)),
+             passCount);
+    sendDashboardText(text);
+
+    samplesThisSecond = 0;
+    lastMagReportMs = nowMs;
 }
 
 // -----------------------------------------------------------------------------
@@ -683,11 +969,11 @@ void setup() {
 
     Serial.begin(USB_BAUD);
 
-    setupBeamBreak();
-
     if (RADIO_ENABLED) {
         setupRadio();
     }
+
+    setupMag();
 
     sendDashboardText(RADIO_ENABLED ? "RF69 relay ready"
                                     : "Relay ready (radio disabled)");
@@ -711,13 +997,23 @@ static void setupRadio() {
 
     radio.setEncryptionKey(const_cast<uint8_t*>(RF69_ENCRYPTION_KEY));
     radio.setTxPower(RF69_TX_POWER_DBM, RF69_HIGH_POWER);
+    radio.attachTimedInterrupt();
     restoreRadioReceiveMode();
 }
 
 void loop() {
     processDashboardSerial();
     processRadio();
-    processBeamBreak();
+    processMag();
+    reportMag();
+
+    // Hold pings while a pass is being sampled: a transmit stalls the loop for
+    // a millisecond or so, which would leave a hole in the pass.
+    if (RADIO_ENABLED && droneConnected && !pass.active &&
+        static_cast<uint32_t>(millis() - lastPingMs) >= PING_INTERVAL_MS) {
+        lastPingMs = millis();
+        sendPing();
+    }
 
     if (droneConnected &&
         static_cast<uint32_t>(millis() - lastRadioPacketMs) > RADIO_TIMEOUT_MS) {
