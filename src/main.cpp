@@ -85,22 +85,44 @@ static constexpr uint16_t PING_INTERVAL_MS = 200;
 // manufacturer ID is used: SparkFun's board is 0x22, other variants differ.
 static const uint8_t MAG_ADDRESSES[] = {0x22, 0x35, 0x78, 0x44};
 
-// Which axis to measure. Pick the one that points from the sensor to the
-// magnet at the bottom of the swing: its field peaks there and is symmetric
-// about the bottom, which is what the centroid timing relies on.
-enum MagAxis : uint8_t { MAG_AXIS_X = 0, MAG_AXIS_Y = 1, MAG_AXIS_Z = 2 };
-static constexpr MagAxis MAG_AXIS = MAG_AXIS_Z;
+// The detector uses the magnitude of the change in the full 3-axis field,
+// |B - B_rest|. For any magnet orientation (axial, diametric, a stack) that is
+// a single hump peaking at closest approach and symmetric about it, which is
+// what the centroid timing relies on. A single axis is not: a magnet whose
+// poles lie horizontal gives a +/- pair of lobes on Z, which counted as two or
+// three passes per real one.
 
-// The field must move this far from the resting baseline to start a pass, and
-// fall back inside the exit level to end one. In microtesla; Earth's field is
-// about 50 uT and a small neodymium magnet a couple of cm away gives tens of
-// mT. Tune with the "MAG" debug lines, which report the live field.
-static constexpr int32_t PASS_ENTER_UT = 2000;
-static constexpr int32_t PASS_EXIT_UT = 1000;
+// The field change must reach this to start a pass, and the pass ends once it
+// has stayed below the exit level for PASS_MERGE_MS. In microtesla; Earth's
+// field is about 50 uT and a small neodymium magnet a couple of cm away gives
+// tens of mT. Tune with the "MAG" debug lines, which report the live change.
+static constexpr int32_t PASS_ENTER_UT = 20000;
+static constexpr int32_t PASS_EXIT_UT = 20000;
+
+// After the field drops below the exit level, wait this long before closing
+// the pass. A dip between the lobes of a multi-magnet stack then stays part
+// of one pass. Must stay well under half the pendulum period (~1.45 s).
+static constexpr uint16_t PASS_MERGE_MS = 100;
+
+// A pass with fewer samples above the enter level is a glitch, not a swing;
+// it is dropped. Kept to a sample count, not a time: a fast swing is over the
+// sensor for only a few ms.
+static constexpr uint8_t PASS_MIN_SAMPLES = 3;
 
 // A pass longer than this is not a swing going by (magnet parked over the
-// sensor, or a baseline that moved); it is dropped and the baseline re-learnt.
-static constexpr uint16_t PASS_MAX_MS = 500;
+// sensor); it is dropped. The baseline is not touched.
+static constexpr uint16_t PASS_MAX_MS = 1500;
+
+// The baseline (Earth's field plus offsets) is learnt at boot with the magnet
+// away. Afterwards it only follows slow drift, and only while the field is
+// within this distance of it, so a magnet hanging near the sensor at the end
+// of a test cannot pull it in.
+static constexpr int32_t BASELINE_TRACK_UT = 300;
+
+// Field sampling rate. Reads are paced to this so samples are evenly spaced.
+// A 3-axis read is 6 bytes; the Uno manages a little over 2000 Hz.
+static constexpr uint16_t MAG_SAMPLE_HZ = 2000;
+static constexpr uint32_t MAG_SAMPLE_PERIOD_US = 1000000UL / MAG_SAMPLE_HZ;
 
 // How often the live field is reported as debug text, for tuning.
 static constexpr uint16_t MAG_REPORT_MS = 1000;
@@ -370,7 +392,9 @@ static void transmitRadio(
     const uint8_t packetNumber = radioTxPacketNumber++;
 
     radio.setHeaderId(packetNumber);
-    radio.setHeaderFlags(messageType);
+    // Clear all eight bits: RadioHead's default mask is only the low nibble,
+    // which would let a high bit from an earlier type stick.
+    radio.setHeaderFlags(messageType, 0xFF);
 
     radio.send(message, RADIO_MESSAGE_SIZE);
     radio.waitPacketSent();
@@ -472,6 +496,8 @@ static void handleTimePong(const uint8_t* pong, uint32_t t4, uint8_t rssi) {
 // RF receive
 // -----------------------------------------------------------------------------
 
+static void sendSetupAck();   // Deferred while a pass is sampled; see below
+
 static void processRadio() {
     if (!RADIO_ENABLED || !radio.available()) {
         return;
@@ -523,7 +549,7 @@ static void processRadio() {
     // re-pings after a reboot, so answer every one rather than only the first.
     if (messageType == RADIO_SETUP &&
         memcmp(frame, RADIO_LINK_ACK, RADIO_MESSAGE_SIZE) != 0) {
-        transmitRadio(RADIO_SETUP, RADIO_LINK_ACK);
+        sendSetupAck();
     }
 }
 
@@ -538,7 +564,7 @@ static constexpr uint8_t TMAG_SENSOR_CONFIG_1 = 0x02;
 static constexpr uint8_t TMAG_SENSOR_CONFIG_2 = 0x03;
 static constexpr uint8_t TMAG_DEVICE_ID = 0x0D;
 static constexpr uint8_t TMAG_MANUFACTURER_ID_LSB = 0x0E;
-static constexpr uint8_t TMAG_X_MSB_RESULT = 0x12; // Y and Z follow, 2 bytes each
+static constexpr uint8_t TMAG_X_MSB_RESULT = 0x12; // X, Y, Z: 2 bytes each, MSB first
 
 static constexpr uint8_t TMAG_MODE_CONTINUOUS = 0x02;
 static constexpr uint8_t TMAG_WIDE_RANGE = 0x03;   // X_Y_RANGE and Z_RANGE: +-80 / +-266 mT
@@ -546,11 +572,13 @@ static constexpr uint16_t TI_MANUFACTURER_ID = 0x5449;
 
 static uint8_t magAddress = 0;      // 0 = no sensor found
 static int32_t magRangeUt = 0;      // Full scale of the configured range
-static int32_t passEnterCounts = 0;
-static int32_t passExitCounts = 0;
+static float passEnterCounts = 0;
+static float passExitCounts = 0;
+static float baselineTrackSq = 0;   // BASELINE_TRACK_UT in counts, squared
+static bool magnetParked = false;   // A too-long pass was dropped; wait for the field to clear
 
-// Resting field, in counts x 16 for a smooth fixed-point average.
-static int32_t baselineX16 = 0;
+// Resting field per axis, in counts x 16 for a smooth fixed-point average.
+static int32_t baselineX16[3] = {0, 0, 0};
 static bool baselineReady = false;
 static uint16_t baselineSamples = 0;
 
@@ -558,23 +586,29 @@ struct Pass {
     bool active;
     uint32_t startUs;
     uint32_t lastUs;
-    int32_t lastWeight;    // Weight of the previous sample, counts above exit level
+    uint32_t lastAboveUs;  // Last sample above the exit level
+    float lastWeight;      // Weight of the previous sample, counts above exit level
     float area;            // Integral of weight dt
     float moment;          // Integral of weight * (t - startUs) dt
     uint32_t peakUs;
-    int16_t peakRaw;
-    int32_t peakDev;
+    float peakDev;         // Largest |B - B_rest|, counts
     uint16_t samples;
+    uint16_t samplesAboveEnter;
     uint16_t maxGapUs;
 };
 
 static Pass pass = {};
 static uint16_t passCount = 0;
+static uint16_t droppedHeartbeats = 0;   // Heartbeats not sent because a pass was being sampled
 
 // For the 1 Hz MAG debug line
 static uint16_t samplesThisSecond = 0;
 static uint32_t lastMagReportMs = 0;
-static int16_t lastRaw = 0;
+static float lastDev = 0;
+static float maxDevThisSecond = 0;
+
+// Scheduled time of the next field read
+static uint32_t nextSampleUs = 0;
 
 static bool tmagWrite(uint8_t reg, uint8_t value) {
     Wire.beginTransmission(magAddress);
@@ -625,8 +659,7 @@ static void setupMag() {
     const bool ok =
         tmagWrite(TMAG_DEVICE_CONFIG_1, 0x00) &&                        // 1x averaging: fastest conversion
         tmagWrite(TMAG_SENSOR_CONFIG_2, TMAG_WIDE_RANGE) &&
-        tmagWrite(TMAG_SENSOR_CONFIG_1, static_cast<uint8_t>(
-                      (MAG_AXIS == MAG_AXIS_X ? 0x1 : MAG_AXIS == MAG_AXIS_Y ? 0x2 : 0x4) << 4)) &&
+        tmagWrite(TMAG_SENSOR_CONFIG_1, 0x7 << 4) &&                     // MAG_CH_EN = X, Y, Z
         tmagWrite(TMAG_DEVICE_CONFIG_2, TMAG_MODE_CONTINUOUS);
     if (!ok) {
         magAddress = 0;
@@ -634,12 +667,14 @@ static void setupMag() {
         return;
     }
 
-    passEnterCounts = microteslaToCounts(PASS_ENTER_UT);
-    passExitCounts = microteslaToCounts(PASS_EXIT_UT);
+    passEnterCounts = static_cast<float>(microteslaToCounts(PASS_ENTER_UT));
+    passExitCounts = static_cast<float>(microteslaToCounts(PASS_EXIT_UT));
+    const int32_t trackCounts = microteslaToCounts(BASELINE_TRACK_UT);
+    baselineTrackSq = static_cast<float>(trackCounts) * trackCounts;
 
     char text[48];
-    snprintf(text, sizeof(text), "TMAG5273 at 0x%02X, +-%ld mT, axis %c",
-             magAddress, static_cast<long>(magRangeUt / 1000), "XYZ"[MAG_AXIS]);
+    snprintf(text, sizeof(text), "TMAG5273 at 0x%02X, +-%ld mT, axes XYZ",
+             magAddress, static_cast<long>(magRangeUt / 1000));
     sendDashboardText(text);
 }
 
@@ -649,25 +684,34 @@ static void setupMag() {
  *   [2..5]   centroidUs  field-weighted mean time of the pass: the bottom of
  *                        the swing, for a field symmetric about it
  *   [6..9]   startUs     first sample past the enter level
- *   [10..13] endUs       first sample back inside the exit level
- *   [14..17] peakUs      sample with the largest deviation
- *   [18..19] peakRaw     int16 raw reading at peakUs
- *   [20..21] baselineRaw int16 resting reading
+ *   [10..13] endUs       last sample above the exit level
+ *   [14..17] peakUs      sample with the largest field change
+ *   [18..19] peakRaw     int16 peak |B - B_rest|, counts (always positive)
+ *   [20..21] baselineRaw int16 |B_rest|, counts
  *   [22..23] samples     uint16 samples in the pass
  *   [24..25] maxGapUs    uint16 longest time between two of them
  * Field in mT = raw * range / 32768; range is in the TMAG5273 debug line.
+ * The magnitude carries no swing direction: passes alternate direction.
  */
 static void sendPassFrame() {
     const uint32_t centroidUs = pass.startUs + static_cast<uint32_t>(pass.moment / pass.area + 0.5f);
+
+    float baseSq = 0;
+    for (uint8_t i = 0; i < 3; ++i) {
+        const float b = baselineX16[i] / 16.0f;
+        baseSq += b * b;
+    }
+    const float peak = pass.peakDev > 32767.0f ? 32767.0f : pass.peakDev;
+    const float base = sqrtf(baseSq) > 32767.0f ? 32767.0f : sqrtf(baseSq);
 
     uint8_t payload[26];
     writeU16(&payload[0], passCount);
     writeU32(&payload[2], centroidUs);
     writeU32(&payload[6], pass.startUs);
-    writeU32(&payload[10], pass.lastUs);
+    writeU32(&payload[10], pass.lastAboveUs);
     writeU32(&payload[14], pass.peakUs);
-    writeU16(&payload[18], static_cast<uint16_t>(pass.peakRaw));
-    writeU16(&payload[20], static_cast<uint16_t>(baselineX16 / 16));
+    writeU16(&payload[18], static_cast<uint16_t>(static_cast<int16_t>(peak + 0.5f)));
+    writeU16(&payload[20], static_cast<uint16_t>(static_cast<int16_t>(base + 0.5f)));
     writeU16(&payload[22], pass.samples);
     writeU16(&payload[24], pass.maxGapUs);
 
@@ -676,9 +720,9 @@ static void sendPassFrame() {
 }
 
 /**
- * Take one field sample and run the pass detector on it.
+ * Take one 3-axis field sample and run the pass detector on it.
  *
- * The bottom of the swing is found as the centroid of the field above the
+ * The bottom of the swing is found as the centroid of |B - B_rest| above the
  * exit level, integrated with the trapezoid rule over the actual sample times.
  * That holds up to uneven sampling (a radio transmit pauses the loop for a
  * millisecond or so) and does not depend on the threshold, as long as the
@@ -687,49 +731,79 @@ static void sendPassFrame() {
 static void processMag() {
     if (magAddress == 0) return;
 
-    uint8_t bytes[2];
+    // Pace reads to MAG_SAMPLE_HZ. Stepping the schedule by a fixed period
+    // keeps the average rate exact; after a long stall (a radio transmit) it
+    // restarts from now instead of firing a burst of catch-up reads.
+    const uint32_t nowSchedUs = micros();
+    if (static_cast<int32_t>(nowSchedUs - nextSampleUs) < 0) return;
+    nextSampleUs += MAG_SAMPLE_PERIOD_US;
+    if (static_cast<int32_t>(nowSchedUs - nextSampleUs) >= 0) {
+        nextSampleUs = nowSchedUs + MAG_SAMPLE_PERIOD_US;
+    }
+
+    uint8_t bytes[6];
     // Stamp the middle of the read: the conversion it returns finished just
     // before it, a fixed latency the same on every pass.
     const uint32_t before = micros();
-    if (!tmagRead(magAddress, TMAG_X_MSB_RESULT + 2 * MAG_AXIS, bytes, 2)) return;
+    if (!tmagRead(magAddress, TMAG_X_MSB_RESULT, bytes, 6)) return;
     const uint32_t nowUs = before + (micros() - before) / 2;
 
-    const int16_t raw = static_cast<int16_t>((static_cast<uint16_t>(bytes[0]) << 8) | bytes[1]);
-    lastRaw = raw;
+    int16_t raw[3];
+    for (uint8_t i = 0; i < 3; ++i) {
+        raw[i] = static_cast<int16_t>((static_cast<uint16_t>(bytes[2 * i]) << 8) | bytes[2 * i + 1]);
+    }
     ++samplesThisSecond;
 
     // Learn the resting field before detecting anything.
     if (!baselineReady) {
-        baselineX16 = baselineSamples == 0 ? static_cast<int32_t>(raw) * 16
-                                           : baselineX16 + (static_cast<int32_t>(raw) * 16 - baselineX16) / 8;
+        for (uint8_t i = 0; i < 3; ++i) {
+            baselineX16[i] = baselineSamples == 0
+                                 ? static_cast<int32_t>(raw[i]) * 16
+                                 : baselineX16[i] + (static_cast<int32_t>(raw[i]) * 16 - baselineX16[i]) / 8;
+        }
         if (++baselineSamples >= 256) baselineReady = true;
         return;
     }
 
-    int32_t deviation = static_cast<int32_t>(raw) - baselineX16 / 16;
-    if (deviation < 0) deviation = -deviation;
+    float devSq = 0;
+    for (uint8_t i = 0; i < 3; ++i) {
+        const float d = static_cast<float>(static_cast<int32_t>(raw[i]) - baselineX16[i] / 16);
+        devSq += d * d;
+    }
+
+    // Follow slow drift (temperature) only when the magnet is clearly away.
+    if (!pass.active && devSq <= baselineTrackSq) {
+        for (uint8_t i = 0; i < 3; ++i) {
+            baselineX16[i] += (static_cast<int32_t>(raw[i]) * 16 - baselineX16[i]) / 1024;
+        }
+    }
+
+    const float deviation = sqrtf(devSq);
+    lastDev = deviation;
+    if (deviation > maxDevThisSecond) maxDevThisSecond = deviation;
 
     if (!pass.active) {
+        if (magnetParked) {
+            if (deviation <= passExitCounts) magnetParked = false;
+            return;
+        }
         if (deviation >= passEnterCounts) {
             pass = Pass{};
             pass.active = true;
             pass.startUs = nowUs;
             pass.lastUs = nowUs;
+            pass.lastAboveUs = nowUs;
             pass.lastWeight = deviation - passExitCounts;
             pass.peakUs = nowUs;
-            pass.peakRaw = raw;
             pass.peakDev = deviation;
             pass.samples = 1;
-        } else {
-            // Track slow drift (temperature, the drone parked off-centre)
-            // only while nothing is passing.
-            baselineX16 += (static_cast<int32_t>(raw) * 16 - baselineX16) / 256;
+            pass.samplesAboveEnter = 1;
         }
         return;
     }
 
     const uint32_t dt = nowUs - pass.lastUs;
-    const int32_t weight = deviation > passExitCounts ? deviation - passExitCounts : 0;
+    const float weight = deviation > passExitCounts ? deviation - passExitCounts : 0.0f;
     const float tPrev = static_cast<float>(pass.lastUs - pass.startUs);
     const float tNow = static_cast<float>(nowUs - pass.startUs);
     pass.area += 0.5f * (pass.lastWeight + weight) * dt;
@@ -739,20 +813,22 @@ static void processMag() {
     pass.lastWeight = weight;
     ++pass.samples;
 
+    if (deviation > passExitCounts) pass.lastAboveUs = nowUs;
+    if (deviation >= passEnterCounts && pass.samplesAboveEnter < 0xFFFF) ++pass.samplesAboveEnter;
     if (deviation > pass.peakDev) {
         pass.peakDev = deviation;
-        pass.peakRaw = raw;
         pass.peakUs = nowUs;
     }
 
-    if (deviation <= passExitCounts) {
+    if (nowUs - pass.lastAboveUs >= static_cast<uint32_t>(PASS_MERGE_MS) * 1000UL) {
         pass.active = false;
-        if (pass.area > 0.0f) sendPassFrame();
+        if (pass.samplesAboveEnter >= PASS_MIN_SAMPLES && pass.area > 0.0f) sendPassFrame();
     } else if (nowUs - pass.startUs > static_cast<uint32_t>(PASS_MAX_MS) * 1000UL) {
+        // Magnet parked over the sensor. Wait for it to leave before the next
+        // pass can start, so the departure is not counted either.
         pass.active = false;
-        baselineReady = false;
-        baselineSamples = 0;
-        sendDashboardText("MAG pass too long - relearning baseline");
+        magnetParked = true;
+        sendDashboardText("MAG pass too long - dropped");
     }
 }
 
@@ -761,16 +837,17 @@ static void reportMag() {
     const uint32_t nowMs = millis();
     if (nowMs - lastMagReportMs < MAG_REPORT_MS) return;
 
-    const int32_t fieldUt = static_cast<int32_t>((static_cast<int64_t>(lastRaw) * magRangeUt) / 32768);
-    const int32_t baseUt = static_cast<int32_t>((static_cast<int64_t>(baselineX16 / 16) * magRangeUt) / 32768);
-    char text[64];
-    snprintf(text, sizeof(text), "MAG %ld uT base %ld uT %u Hz passes %u",
-             static_cast<long>(fieldUt), static_cast<long>(baseUt),
+    const int32_t devUt = static_cast<int32_t>(lastDev * magRangeUt / 32768.0f);
+    const int32_t maxUt = static_cast<int32_t>(maxDevThisSecond * magRangeUt / 32768.0f);
+    char text[80];
+    snprintf(text, sizeof(text), "MAG dB %ld uT max %ld uT %u Hz passes %u hb dropped %u",
+             static_cast<long>(devUt), static_cast<long>(maxUt),
              static_cast<unsigned>(samplesThisSecond * 1000UL / (nowMs - lastMagReportMs)),
-             passCount);
+             passCount, droppedHeartbeats);
     sendDashboardText(text);
 
     samplesThisSecond = 0;
+    maxDevThisSecond = 0;
     lastMagReportMs = nowMs;
 }
 
@@ -805,6 +882,84 @@ struct DashboardRxParser {
 
 static DashboardRxParser dashboardRx;
 
+// Radio transmits block the loop for ~2.6 ms (send + waitPacketSent), which
+// left a hole in about half of all passes. While a pass is being sampled,
+// heartbeats are dropped (the drone is not in a mode that needs them during
+// the pendulum test) and other transmits wait here until it ends.
+static constexpr uint8_t DEFERRED_TX_SLOTS = 4;
+struct DeferredTx {
+    uint8_t type;
+    uint8_t message[RADIO_MESSAGE_SIZE];
+};
+static DeferredTx deferredTx[DEFERRED_TX_SLOTS];
+static uint8_t deferredTxCount = 0;
+static bool deferredSetupAck = false;
+
+static void transmitOrDefer(uint8_t type, const uint8_t message[RADIO_MESSAGE_SIZE]) {
+    if (!pass.active) {
+        transmitRadio(type, message);
+        return;
+    }
+    if (type == RADIO_HEARTBEAT) {
+        ++droppedHeartbeats;
+        return;
+    }
+    if (deferredTxCount == DEFERRED_TX_SLOTS) {
+        // Full: drop the oldest so the latest command still goes out.
+        memmove(&deferredTx[0], &deferredTx[1], sizeof(DeferredTx) * (DEFERRED_TX_SLOTS - 1));
+        --deferredTxCount;
+    }
+    deferredTx[deferredTxCount].type = type;
+    memcpy(deferredTx[deferredTxCount].message, message, RADIO_MESSAGE_SIZE);
+    ++deferredTxCount;
+}
+
+static void sendSetupAck() {
+    if (pass.active) {
+        deferredSetupAck = true;   // Sent by flushDeferredTransmits()
+    } else {
+        transmitRadio(RADIO_SETUP, RADIO_LINK_ACK);
+    }
+}
+
+static void flushDeferredTransmits() {
+    if (pass.active) return;
+    for (uint8_t i = 0; i < deferredTxCount; ++i) {
+        transmitRadio(deferredTx[i].type, deferredTx[i].message);
+    }
+    deferredTxCount = 0;
+    if (deferredSetupAck) {
+        deferredSetupAck = false;
+        transmitRadio(RADIO_SETUP, RADIO_LINK_ACK);
+    }
+}
+
+// The relay only acts on RAW and RADIO_PACKET frames. Anything else means the
+// dashboard thinks it is wired straight to the drone (its identify query got
+// no reply), and every command it sends is lost. Say so instead of dropping
+// them silently. Rate limited: in that state heartbeats alone arrive every 25 ms.
+static constexpr uint32_t UNHANDLED_REPORT_INTERVAL_MS = 2000;
+static uint16_t unhandledFrames = 0;
+static uint8_t lastUnhandledType = 0;
+static uint32_t lastUnhandledReportMs = 0;
+
+static void noteUnhandledFrame(uint8_t type) {
+    ++unhandledFrames;
+    lastUnhandledType = type;
+    const uint32_t now = millis();
+    if (lastUnhandledReportMs != 0 &&
+        static_cast<uint32_t>(now - lastUnhandledReportMs) < UNHANDLED_REPORT_INTERVAL_MS) {
+        return;
+    }
+    lastUnhandledReportMs = now == 0 ? 1 : now;
+
+    char text[64];
+    snprintf(text, sizeof(text), "Relay dropped %u frame(s), last type %u: not a RADIO_PACKET",
+             unhandledFrames, lastUnhandledType);
+    sendDashboardText(text);
+    unhandledFrames = 0;
+}
+
 static void handleDashboardFrame(
     uint8_t type,
     const uint8_t* payload,
@@ -822,11 +977,14 @@ static void handleDashboardFrame(
             // Transmit request: [direction hint, packet placeholder, type,
             // 8-byte message]. The relay assigns its own packet number.
             if (payloadLength >= RADIO_ENVELOPE_SIZE) {
-                transmitRadio(payload[2], &payload[3]);
+                transmitOrDefer(payload[2], &payload[3]);
+            } else {
+                noteUnhandledFrame(type);
             }
             break;
 
         default:
+            noteUnhandledFrame(type);
             break;
     }
 }
@@ -1006,6 +1164,7 @@ void loop() {
     processRadio();
     processMag();
     reportMag();
+    flushDeferredTransmits();
 
     // Hold pings while a pass is being sampled: a transmit stalls the loop for
     // a millisecond or so, which would leave a hole in the pass.

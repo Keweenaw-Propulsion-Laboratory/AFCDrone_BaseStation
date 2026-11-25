@@ -115,7 +115,7 @@ The drone swings on a pendulum logging its gyro to SD. A magnet on the drone pas
 | `3V3` | 3.3 V | |
 | `GND` | GND | |
 
-The sensor is found at 0x22, 0x35, 0x78 or 0x44, whichever answers with TI's ID, and reported at boot as `TMAG5273 at 0x22, +-80 mT, axis Z`. Mount it so the chosen axis (`MAG_AXIS`, default Z) points at the magnet when the drone hangs at rest. That axis's field then peaks at the bottom of the swing and is symmetric about it.
+The sensor is found at 0x22, 0x35, 0x78 or 0x44, whichever answers with TI's ID, and reported at boot as `TMAG5273 at 0x22, +-80 mT, axes XYZ`. All three axes are read, and the detector uses the magnitude of the change from the resting field, |B − B_rest|. That gives one hump, symmetric about the bottom of the swing, for any magnet orientation: axial, diametric, or a stack of several. The sensor can face any way. Keep the magnet within a few cm of it at the bottom of the swing.
 
 ### Tuning
 
@@ -123,16 +123,21 @@ Settings are at the top of [src/main.cpp](src/main.cpp):
 
 | Constant | Default | Purpose |
 |---|---|---|
-| `MAG_AXIS` | `MAG_AXIS_Z` | Axis measured. Only one is converted, for the fastest sampling. |
-| `PASS_ENTER_UT` / `PASS_EXIT_UT` | 2000 / 1000 uT | Distance from the resting field that starts and ends a pass |
-| `PASS_MAX_MS` | 500 | A longer "pass" is discarded and the baseline re-learnt |
+| `PASS_ENTER_UT` / `PASS_EXIT_UT` | 3000 / 1500 uT | Field change that starts a pass, and the level it must stay under for the pass to end |
+| `PASS_MERGE_MS` | 60 | How long the field must stay under the exit level before the pass closes. Dips between lobes of a magnet stack stay in one pass. |
+| `PASS_MIN_SAMPLES` | 3 | Fewer samples above the enter level is a glitch, and the pass is dropped |
+| `PASS_MAX_MS` | 1500 | A longer "pass" is the magnet parked over the sensor. It is dropped, and nothing is counted until the field clears. |
+| `BASELINE_TRACK_UT` | 300 uT | The resting field follows slow drift only while the field is within this distance of it |
+| `MAG_SAMPLE_HZ` | 2000 | Field sampling rate. Reads are paced to it for even spacing. |
 | `PING_INTERVAL_MS` | 200 | Clock-sync rate |
 
-Once a second the relay prints `MAG <field> uT base <baseline> uT <rate> Hz passes <n>`. Swing the drone by hand and set `PASS_ENTER_UT` to about half the peak deviation from the baseline. Sampling runs at about 4–5 kHz. The baseline is learnt from the first 256 samples after boot, so keep the magnet away from the sensor while the relay starts.
+Once a second the relay prints `MAG dB <change> uT max <largest change that second> uT <rate> Hz passes <n> hb dropped <n>`. Swing the drone by hand and set `PASS_ENTER_UT` to about half the smallest `max` you see on a pass. The baseline is learnt from the first 256 samples after boot, so keep the magnet away from the sensor while the relay starts. After that it does not follow the magnet, even when the pendulum comes to rest over the sensor.
 
 ### How a pass is timed
 
-Each sample is stamped with `micros()`. The pass time is the centroid of the field above the exit level, integrated over the actual sample times. For a field symmetric about the bottom of the swing, that is the bottom, independent of the threshold. Pings are held while a pass is in progress, so a radio transmit does not leave a hole in it.
+Each sample is stamped with `micros()`. The pass time is the centroid of |B − B_rest| above the exit level, integrated over the actual sample times. For a field symmetric about the bottom of the swing, that is the bottom, independent of the threshold. No radio transmit happens while a pass is in progress, because each one stalls the loop for about 2.6 ms and would leave a hole in the samples. Clock-sync pings wait, dashboard heartbeats (every 25 ms) are dropped, and other transmit requests and the SETUP ACK are queued (up to 4) and sent when the pass ends. Dropping heartbeats is fine for the pendulum test, where the drone does not need them, but this firmware should not be used to fly.
+
+In `BASE_MAG_PASS`, `peakRaw` is the peak field change and `baselineRaw` is the size of the resting field, both in counts and both positive. Neither gives the swing direction any more. Passes alternate direction, so tell them apart by parity, not by sign.
 
 ### Clock sync
 
@@ -143,7 +148,7 @@ Every 200 ms, while the drone is linked, the relay sends `TIME_PING` and the dro
 | Type | Payload |
 |---:|---|
 | 20 `BASE_TIMESYNC` (18 bytes) | `uint16 seq`, `uint32 t1`, `uint32 t2`, `uint32 t4`, `uint8 prevSeq`, `uint16 prevTxMinusRx`, `uint8 rssi` |
-| 21 `BASE_MAG_PASS` (26 bytes) | `uint16 index`, `uint32 centroidUs`, `uint32 startUs`, `uint32 endUs`, `uint32 peakUs`, `int16 peakRaw`, `int16 baselineRaw`, `uint16 samples`, `uint16 maxGapUs` |
+| 21 `BASE_MAG_PASS` (26 bytes) | `uint16 index`, `uint32 centroidUs`, `uint32 startUs`, `uint32 endUs`, `uint32 peakUs`, `int16 peakRaw` (\|ΔB\| peak), `int16 baselineRaw` (\|B_rest\|), `uint16 samples`, `uint16 maxGapUs` |
 
 Run the dashboard server with `--pendulum-log DIR` to write these to CSV.
 
